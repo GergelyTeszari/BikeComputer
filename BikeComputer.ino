@@ -135,7 +135,7 @@ void loop()
       digitalWrite(blinker, HIGH);
   }
       
-  if (digitalRead(sensorPin) == HIGH && prevState == LOW)
+  else if (digitalRead(sensorPin) == HIGH && prevState == LOW)
   { /* Magnet left the sensor */
     prevState = HIGH;
     digitalWrite(blinker, LOW);
