@@ -1,15 +1,19 @@
 /**
  * @file BikeComputer.ino
- * 
- * Written for Arduino Nano board
- * 
+ *
+ * Arduino Nano / Uno bicycle computer prototype.
+ *
+ * Measures wheel speed, trip distance and average speed using a wheel sensor,
+ * then displays the values on a 16x2 LCD.
+ *
+ * Written for Arduino Nano board.
+ *
  * $Author: Gergely Teszári
  * $Date: 2022.08.21.
- * $Revision: 3.0
- * 
+ * $Revision: 3.1
+ *
  * @copyright Gergely Teszári
- * 
-*/
+ */
 
 /**** INCLUDES ***********************************************************************************/
 
@@ -18,224 +22,327 @@
 
 /**** END OF INCLUDES ****************************************************************************/
 
-/**** MACROS *************************************************************************************/
+/**** CONSTANTS **********************************************************************************/
 
-/* LCD initialization 
- *  Pay close attention to the signal pins of the LCD
- *  For my PCB layout it is (rs 10), (en 8), (d4 3), (d5 2), (d6 5), (d7 4)
- *  Also pay close attention NOT to use one of the LCD signal ports as 
- *  the input port from the rotation detecter sensor
-*/
-#include <LiquidCrystal.h>
-#define rs (10)
-#define en (8)
-#define d4 (3)
-#define d5 (2)
-#define d6 (5)
-#define d7 (4)
-LiquidCrystal lcd(rs,en,d4,d5,d6,d7);
+/* LCD initialization
+ * Pay close attention to the signal pins of the LCD.
+ * For my PCB layout it is: RS 10, EN 8, D4 3, D5 2, D6 5, D7 4.
+ * Do not use one of the LCD signal ports as the rotation detector input.
+ */
+const byte LCD_RS = 10;
+const byte LCD_EN = 8;
+const byte LCD_D4 = 3;
+const byte LCD_D5 = 2;
+const byte LCD_D6 = 5;
+const byte LCD_D7 = 4;
 
 /* Port definitions */
-#define sensorPin (12)
-#define blinker (13)
-#define isMetricUnit (determineMetricUnit()) 
+const byte SENSOR_PIN = 12;
+const byte STATUS_LED_PIN = 13;
 
-#define button1 A0
-#define button2 A1
-#define button3 A4
-#define button4 A5
+const byte BUTTON_1_PIN = A0;
+const byte BUTTON_2_PIN = A1;
+const byte BUTTON_3_PIN = A4;
+const byte BUTTON_4_PIN = A5;
 
-/**** END OF MACROS ******************************************************************************/
+/* Bike configuration */
+const float WHEEL_CIRCUMFERENCE_M = 2.04f;
+const float MAX_VALID_SPEED_KMH = 100.0f;
+const float SPEED_SMOOTHING_FACTOR = 0.5f;
 
-/**** TYPE DEFINITIONS ***************************************************************************/
+/* Timing configuration */
+const unsigned long STOPPED_TIMEOUT_MS = 2000UL;
+const unsigned long AVERAGE_SAMPLE_PERIOD_MS = 30000UL;
+const unsigned long MIN_DISPLAY_REFRESH_PERIOD_MS = 250UL;
 
-/**** END OF TYPE DEFINITIONS ********************************************************************/
+/**** END OF CONSTANTS ***************************************************************************/
+
+/**** GLOBAL OBJECTS *****************************************************************************/
+
+LiquidCrystal lcd(LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
+
+/**** END OF GLOBAL OBJECTS **********************************************************************/
 
 /**** VARIABLES **********************************************************************************/
 
-float wheelCircumference = 2.04; /* defined in meters, overwritten if not metric unit system */
+bool previousSensorState = HIGH;
+bool hasLastRotationTime = false;
+bool hasCurrentSpeed = false;
+bool displayUpdateRequested = true;
 
-/* SpeedoMeter variables */
-bool prevState = HIGH;
-float currentSpeed;
-int timer;
-float longTimer;
-float odo;
-float currentCorrectedSpeed;
-float longAvg;
-int avgDivider = 2;
-int outPrintRequest;
+unsigned long lastRotationTimeMs = 0;
+unsigned long lastAverageSampleTimeMs = 0;
+unsigned long lastDisplayRefreshTimeMs = 0;
+
+float currentSpeedKmh = 0.0f;
+float displayedSpeedKmh = 0.0f;
+float tripDistanceKm = 0.0f;
+float averageSpeedKmh = 0.0f;
+unsigned int averageSampleCount = 0;
+
+volatile bool button1Pressed = false;
+volatile bool button2Pressed = false;
+volatile bool button3Pressed = false;
+volatile bool button4Pressed = false;
 
 /**** END OF VARIABLES ***************************************************************************/
 
 /**** LOCAL FUNCTION DECLARATIONS ****************************************************************/
 
-boolean determineMetricUnit();
 void setup();
 void loop();
+
+void showWelcomeScreen();
+void handleWheelSensor(unsigned long nowMs);
+void handleWheelRotation(unsigned long nowMs);
+void updateStoppedState(unsigned long nowMs);
+void updateAverageSpeed(unsigned long nowMs);
+void handleButtons();
+void resetTrip();
 void printLCD();
-void button1func();
-void button2func();
-void button3func();
-void button4func();
+
+void button1Interrupt();
+void button2Interrupt();
+void button3Interrupt();
+void button4Interrupt();
 
 /**** END OF LOCAL FUNCTION DECLARATIONS *********************************************************/
 
 /**** LOCAL FUNCTION DEFINITIONS *****************************************************************/
 
-boolean determineMetricUnit() /* TODO */
-{
-  return true;
-}
-
 void setup()
 {
-  lcd.begin(16,2);
-  pinMode(sensorPin, INPUT);
-  digitalWrite(sensorPin,LOW);
-  pinMode(blinker, OUTPUT);
-  digitalWrite(blinker,LOW);
-  if (false == isMetricUnit)
-  {
-    wheelCircumference *= 0.3048;
-  }
-  lcd.clear();
-  lcd.setCursor(4,0);
-  lcd.print("Welcome !");
-  delay(2000);
-  lcd.clear();
-  lcd.setCursor(0,0);
-  lcd.print("Distance unit:");
-  lcd.setCursor(0,1);
-  if (isMetricUnit)
-  {
-    lcd.print("m, Km/h");
-  }
-  else
-  {
-    lcd.print("ft, mi/h ");
-  }
-  delay(2000);
-  
-  pinMode(button1, INPUT_PULLUP);
-  attachPCINT(digitalPinToPCINT(button1), button1func, FALLING);
-  pinMode(button2, INPUT_PULLUP);
-  attachPCINT(digitalPinToPCINT(button2), button2func, FALLING);
-  pinMode(button3, INPUT_PULLUP);
-  attachPCINT(digitalPinToPCINT(button3), button3func, FALLING);
-  pinMode(button4, INPUT_PULLUP);
-  attachPCINT(digitalPinToPCINT(button4), button4func, FALLING);
+  lcd.begin(16, 2);
+
+  pinMode(SENSOR_PIN, INPUT);
+  digitalWrite(SENSOR_PIN, LOW);
+
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  digitalWrite(STATUS_LED_PIN, LOW);
+
+  pinMode(BUTTON_1_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_2_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_3_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_4_PIN, INPUT_PULLUP);
+
+  attachPCINT(digitalPinToPCINT(BUTTON_1_PIN), button1Interrupt, FALLING);
+  attachPCINT(digitalPinToPCINT(BUTTON_2_PIN), button2Interrupt, FALLING);
+  attachPCINT(digitalPinToPCINT(BUTTON_3_PIN), button3Interrupt, FALLING);
+  attachPCINT(digitalPinToPCINT(BUTTON_4_PIN), button4Interrupt, FALLING);
+
+  lastAverageSampleTimeMs = millis();
+  lastDisplayRefreshTimeMs = millis();
+
+  showWelcomeScreen();
+  printLCD();
 }
 
 void loop()
 {
-  if (digitalRead(sensorPin) == LOW && prevState == HIGH)
-  { /* Magnet triggered sensor */
-      prevState = LOW;
-      digitalWrite(blinker, HIGH);
-  }
-      
-  else if (digitalRead(sensorPin) == HIGH && prevState == LOW)
-  { /* Magnet left the sensor */
-    prevState = HIGH;
-    digitalWrite(blinker, LOW);
-    odo += wheelCircumference/1000;
-    currentSpeed = (3600.0 * wheelCircumference) / timer;
-    if (false == isMetricUnit)
-    {
-        currentSpeed /= 1.609344;
-    }
-    if (currentSpeed < 100.0)
-    {
-        currentCorrectedSpeed += currentSpeed;
-        currentCorrectedSpeed /= 2;
-    }
-    printLCD();
-    timer=0;
-  }
-  
-  else 
-  { /* Sensor is waiting */
-    if (timer > 2000)
-    {
-      currentSpeed = 0;
-      currentCorrectedSpeed = 0;
-      timer = 0;
-      printLCD();
-    }
-  }
-  if (longTimer >= 30.0)
+  const unsigned long nowMs = millis();
+
+  handleWheelSensor(nowMs);
+  updateStoppedState(nowMs);
+  updateAverageSpeed(nowMs);
+  handleButtons();
+
+  if (displayUpdateRequested &&
+      nowMs - lastDisplayRefreshTimeMs >= MIN_DISPLAY_REFRESH_PERIOD_MS)
   {
-    longAvg += currentCorrectedSpeed;
-    longAvg /= avgDivider;
-    avgDivider++;
-    longTimer = 0;
+    printLCD();
   }
-  /* Counting time for speed calculations */
-  delay(10);
-  timer += 10;
-  longTimer += 0.01;
 }
 
-/* Screen alignment
+void showWelcomeScreen()
+{
+  lcd.clear();
+  lcd.setCursor(4, 0);
+  lcd.print("Welcome !");
+  delay(1500);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Distance unit:");
+  lcd.setCursor(0, 1);
+  lcd.print("m, km/h");
+  delay(1500);
+}
+
+void handleWheelSensor(unsigned long nowMs)
+{
+  const bool sensorState = digitalRead(SENSOR_PIN);
+
+  if (sensorState == LOW && previousSensorState == HIGH)
+  {
+    /* Magnet triggered the sensor. */
+    digitalWrite(STATUS_LED_PIN, HIGH);
+  }
+  else if (sensorState == HIGH && previousSensorState == LOW)
+  {
+    /* Magnet left the sensor. Count one full wheel rotation. */
+    digitalWrite(STATUS_LED_PIN, LOW);
+    handleWheelRotation(nowMs);
+  }
+
+  previousSensorState = sensorState;
+}
+
+void handleWheelRotation(unsigned long nowMs)
+{
+  tripDistanceKm += WHEEL_CIRCUMFERENCE_M / 1000.0f;
+
+  if (hasLastRotationTime)
+  {
+    const unsigned long elapsedMs = nowMs - lastRotationTimeMs;
+
+    if (elapsedMs > 0UL)
+    {
+      const float measuredSpeedKmh =
+        (3600.0f * WHEEL_CIRCUMFERENCE_M) / (float)elapsedMs;
+
+      if (measuredSpeedKmh <= MAX_VALID_SPEED_KMH)
+      {
+        currentSpeedKmh = measuredSpeedKmh;
+
+        if (hasCurrentSpeed)
+        {
+          displayedSpeedKmh =
+            (SPEED_SMOOTHING_FACTOR * currentSpeedKmh) +
+            ((1.0f - SPEED_SMOOTHING_FACTOR) * displayedSpeedKmh);
+        }
+        else
+        {
+          displayedSpeedKmh = currentSpeedKmh;
+          hasCurrentSpeed = true;
+        }
+      }
+    }
+  }
+
+  lastRotationTimeMs = nowMs;
+  hasLastRotationTime = true;
+  displayUpdateRequested = true;
+}
+
+void updateStoppedState(unsigned long nowMs)
+{
+  if (!hasLastRotationTime)
+  {
+    return;
+  }
+
+  if (nowMs - lastRotationTimeMs > STOPPED_TIMEOUT_MS && hasCurrentSpeed)
+  {
+    currentSpeedKmh = 0.0f;
+    displayedSpeedKmh = 0.0f;
+    hasCurrentSpeed = false;
+    displayUpdateRequested = true;
+  }
+}
+
+void updateAverageSpeed(unsigned long nowMs)
+{
+  if (nowMs - lastAverageSampleTimeMs < AVERAGE_SAMPLE_PERIOD_MS)
+  {
+    return;
+  }
+
+  averageSpeedKmh =
+    ((averageSpeedKmh * (float)averageSampleCount) + displayedSpeedKmh) /
+    (float)(averageSampleCount + 1U);
+
+  averageSampleCount++;
+  lastAverageSampleTimeMs = nowMs;
+  displayUpdateRequested = true;
+}
+
+void handleButtons()
+{
+  if (button1Pressed)
+  {
+    button1Pressed = false;
+    resetTrip();
+  }
+
+  if (button2Pressed)
+  {
+    button2Pressed = false;
+    /* Reserved for future UI function. */
+  }
+
+  if (button3Pressed)
+  {
+    button3Pressed = false;
+    /* Reserved for future UI function. */
+  }
+
+  if (button4Pressed)
+  {
+    button4Pressed = false;
+    /* Reserved for future UI function. */
+  }
+}
+
+void resetTrip()
+{
+  currentSpeedKmh = 0.0f;
+  displayedSpeedKmh = 0.0f;
+  tripDistanceKm = 0.0f;
+  averageSpeedKmh = 0.0f;
+  averageSampleCount = 0;
+
+  hasLastRotationTime = false;
+  hasCurrentSpeed = false;
+  lastAverageSampleTimeMs = millis();
+
+  displayUpdateRequested = true;
+}
+
+/* Screen alignment:
 0123456789123456
-Speed  ODO   AVG
---.-  --.-  --.-
+Speed  ODO  AVG
+--.-  --.-- --.-
 */
 void printLCD()
 {
-  outPrintRequest++;
-  if (currentCorrectedSpeed*0.1 <= outPrintRequest || currentCorrectedSpeed == 0)
-  {
-    outPrintRequest = 0;
-    lcd.clear();
-    lcd.setCursor(0,0);
-    lcd.print("Speed  ODO   AVG");
-    lcd.setCursor(0,1);
-    lcd.print(currentCorrectedSpeed);
-    lcd.setCursor(6,1);
-    lcd.print(odo);
-    lcd.setCursor(12,1);
-    lcd.print(longAvg);
-  }
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Speed  ODO  AVG");
+
+  lcd.setCursor(0, 1);
+  lcd.print(displayedSpeedKmh, 1);
+
+  lcd.setCursor(6, 1);
+  lcd.print(tripDistanceKm, 2);
+
+  lcd.setCursor(12, 1);
+  lcd.print(averageSpeedKmh, 1);
+
+  lastDisplayRefreshTimeMs = millis();
+  displayUpdateRequested = false;
 }
 
-void button1func()
+void button1Interrupt()
 {
-  lcd.clear();
-  lcd.setCursor(0,0);
-  lcd.print("Button 1 pressed!");
-  delay(100);
+  button1Pressed = true;
 }
 
-void button2func()
+void button2Interrupt()
 {
-  lcd.clear();
-  lcd.setCursor(0,0);
-  lcd.print("Button 2 pressed!");
-  delay(100);
+  button2Pressed = true;
 }
 
-void button3func()
+void button3Interrupt()
 {
-  lcd.clear();
-  lcd.setCursor(0,0);
-  lcd.print("Button 3 pressed!");
-  delay(100);
+  button3Pressed = true;
 }
 
-void button4func()
+void button4Interrupt()
 {
-  lcd.clear();
-  lcd.setCursor(0,0);
-  lcd.print("Button 4 pressed!");
-  delay(100);
+  button4Pressed = true;
 }
 
 /**** END OF LOCAL FUNCTION DEFINITIONS **********************************************************/
-
-/**** GLOBAL FUNCTION DEFINITIONS ****************************************************************/
-
-/**** END OF GLOBAL FUNCTION DEFINITIONS *********************************************************/
 
 /* End of file BikeComputer.ino */
